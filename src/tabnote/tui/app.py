@@ -5,13 +5,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import ScrollableContainer
-from textual.events import Key
+from textual.events import Key, Resize
 from textual.widgets import Input, Static
 
 from ..editing import EditError, History, clear_token, delete_room, insert_room, set_token
 from ..format import mark_saved, new_document, parse
+from ..model import StringGroup
 from ..storage import ExternalModificationError, FileStamp, save, stamp
 
 _TOKEN_RUN = re.compile(r"[^-|]+")
@@ -22,9 +24,9 @@ class TabnoteApp(App[None]):
 
     CSS = """
     Screen { layout: vertical; }
-    #grid { height: 1fr; border: round $accent; }
-    #notation { width: auto; min-width: 164; }
-    #status { height: 1; background: $panel; padding: 0 1; }
+    #grid { height: 1fr; border: round $accent; background: $surface; }
+    #notation { width: auto; min-width: 164; padding: 0 1; }
+    #status { height: 1; background: $panel; color: $text; padding: 0 1; }
     #command { display: none; }
     """
 
@@ -36,6 +38,7 @@ class TabnoteApp(App[None]):
         self.group_index = 0
         self.string_index = 0
         self.column = 0
+        self.feedback = ""
         if path.exists():
             self.history = History(parse(path.read_text(encoding="utf-8")))
             self.file_stamp: FileStamp | None = stamp(path)
@@ -55,19 +58,80 @@ class TabnoteApp(App[None]):
     def document(self):
         return self.history.current
 
-    def refresh_view(self, message: str = "") -> None:
-        lines: list[str] = []
+    def refresh_view(self, message: str | None = None) -> None:
+        """Render the grid without deriving positions from rendered text."""
+        if message is not None:
+            self.feedback = message
+        notation = Text()
+        label_width = max(
+            (len(label) for group in self.document.groups for label in group.labels), default=1
+        )
         for group_number, group in enumerate(self.document.groups):
-            lines.append(f"[group {group_number + 1}{'' if group.editable else ': read-only'}]")
+            active_group = group_number == self.group_index
+            group_style = "bold cyan" if active_group else "dim"
+            notation.append(
+                f"[ group {group_number + 1}{'' if group.editable else ' · read-only'} ]\n",
+                style=group_style,
+            )
+            notation.append(" " * (label_width + 2) + self._ruler_labels() + "\n", style="dim")
+            notation.append(" " * (label_width + 2) + self._ruler_ticks(group) + "\n", style="dim")
             for string_number, (label, row) in enumerate(zip(group.labels, group.rows)):
                 marker = ">" if (group_number, string_number) == (self.group_index, self.string_index) else " "
-                lines.append(f"{marker}{label}|{row}")
-        self.query_one("#notation", Static).update("\n".join(lines))
+                row_start = len(notation)
+                notation.append(f"{marker}{label:>{label_width}}|{row}")
+                if active_group and string_number == self.string_index:
+                    notation.stylize("on $boost", row_start, len(notation))
+                    cursor_start = row_start + label_width + 2 + self.column
+                    if cursor_start < len(notation):
+                        notation.stylize("bold reverse", cursor_start, cursor_start + 1)
+                notation.append("\n")
+            if group_number != len(self.document.groups) - 1:
+                notation.append("\n")
+        self.query_one("#notation", Static).update(notation)
         dirty = "*" if self.document.dirty else ""
         buffer = f" buffer={self.buffer!r}" if self.mode == "EDIT" else ""
         self.query_one("#status", Static).update(
-            f"{self.mode}{dirty}  group={self.group_index + 1} string={self.string_index + 1} column={self.column + 1}{buffer}  {message}"
+            f"{self.mode}{dirty}  group={self.group_index + 1} string={self.string_index + 1} "
+            f"column={self.column + 1}{buffer}  {self.feedback or 'i edit · : commands · ? help'}"
         )
+        self.call_after_refresh(self._follow_cursor)
+
+    def _ruler_labels(self) -> str:
+        labels = [" "] * 160
+        for column in range(0, 160, 10):
+            number = str(column + 1)
+            labels[column : column + len(number)] = number
+        return "".join(labels)
+
+    def _ruler_ticks(self, group: StringGroup) -> str:
+        bars = {
+            column
+            for column in range(160)
+            if group.rows and all(len(row) > column and row[column] == "|" for row in group.rows)
+        }
+        return "".join(
+            "|" if column in bars else "+" if column % 10 == 0 else "." if column % 5 == 0 else "-"
+            for column in range(160)
+        )
+
+    def _follow_cursor(self) -> None:
+        """Keep the logical anchor in view after movement and terminal resizes."""
+        grid = self.query_one("#grid", ScrollableContainer)
+        label_width = max(
+            (len(label) for group in self.document.groups for label in group.labels), default=1
+        )
+        cursor_x = label_width + 2 + self.column
+        group_top = sum(4 + len(group.rows) for group in self.document.groups[: self.group_index])
+        cursor_y = group_top + 3 + self.string_index
+        grid.scroll_to(
+            x=max(0, cursor_x - max(1, grid.size.width // 2)),
+            y=max(0, cursor_y - max(1, grid.size.height // 2)),
+            animate=False,
+            immediate=True,
+        )
+
+    def on_resize(self, _: Resize) -> None:
+        self.call_after_refresh(self._follow_cursor)
 
     def on_key(self, event: Key) -> None:
         if self.mode == "COMMAND":
@@ -83,6 +147,7 @@ class TabnoteApp(App[None]):
         self._handle_normal_key(event)
 
     def _handle_normal_key(self, event: Key) -> None:
+        self.feedback = ""
         key = event.key
         if key in {"h", "left"}:
             self._move_horizontal(-1)
@@ -113,11 +178,12 @@ class TabnoteApp(App[None]):
             command.value = ":"
             command.focus()
         elif key in {"?", "question_mark"}:
-            self.refresh_view("i edit; Enter/move commits; :w save; :q quit")
+            self.refresh_view("i edit · Enter/move commits · :w save · :q quit")
             return
         self.refresh_view()
 
     def _handle_edit_key(self, event: Key) -> None:
+        self.feedback = ""
         if event.key == "escape":
             self.mode, self.buffer = "NORMAL", ""
         elif event.key == "enter":
@@ -144,7 +210,7 @@ class TabnoteApp(App[None]):
                 document = clear_token(document, self.group_index, self.string_index, self.column, len(token))
             document = set_token(document, self.group_index, self.string_index, self.column, self.buffer)
         except EditError as error:
-            self.refresh_view(str(error))
+            self.feedback = str(error)
             return False
         self.history = self.history.commit(document)
         self.mode, self.buffer = "NORMAL", ""
@@ -184,7 +250,7 @@ class TabnoteApp(App[None]):
         try:
             self._commit(operation())
         except EditError as error:
-            self.refresh_view(str(error))
+            self.feedback = str(error)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         command = event.value.strip()
